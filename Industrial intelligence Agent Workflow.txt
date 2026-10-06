@@ -1,0 +1,183 @@
+"I built a multi-tenant industrial intelligence platform where organizations can ingest machine telemetry, monitor machine health, detect anomalies, predict failures, investigate equipment through an AI agent and receive maintenance alerts through a tenant-isolated dashboard."
+
+That's a software architecture + data engineering + ML + AI-agent project.
+The next major architectural step would be tenant management + generic telemetry ingestion + background processing, rather than immediately adding more datasets.
+
+
+Project name
+
+Industrial Intelligence Agent
+
+
+Get-ChildItem
+python --version
+py -0p
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python --version
+where.exe python
+python -m pip install --upgrade pip setuptools wheel
+python -m pip --version
+python -m pip install -r requirements.txt
+python -m pip list
+
+"Package                   Version
+------------------------- -----------
+alembic                   1.20.0
+altair                    6.3.0
+annotated-types           0.8.0
+anyio                     4.15.1
+attrs                     26.1.0
+certifi                   2026.7.22
+charset-normalizer        3.5.2
+click                     8.5.0
+colorama                  0.4.6
+distro                    1.9.0
+fastapi                   0.115.12
+greenlet                  3.5.6
+h11                       0.16.0
+httpcore                  1.0.9
+httpcore2                 2.13.1
+httptools                 0.8.0
+httpx                     0.28.1
+httpx2                    2.13.1
+idna                      3.20
+iniconfig                 2.3.0
+itsdangerous              2.2.0
+Jinja2                    3.1.6
+jsonpatch                 1.33
+jsonpointer               3.1.1
+jsonschema                4.26.0
+jsonschema-specifications 2025.9.1
+langchain-core            1.6.6
+langchain-protocol        0.0.19
+langchain-text-splitters  1.1.2
+langgraph                 1.2.11
+langgraph-checkpoint      4.2.0
+langgraph-prebuilt        1.1.0
+langgraph-sdk             0.4.5
+langsmith                 0.14.2
+Mako                      1.4.3
+MarkupSafe                3.0.3
+narwhals                  2.26.0
+numpy                     2.5.3
+orjson                    3.12.0
+ormsgpack                 1.12.2
+packaging                 26.3
+pandas                    3.0.2
+pillow                    12.3.0
+pip                       26.2.1
+pluggy                    1.6.0
+protobuf                  7.36.2
+psycopg2-binary           2.9.13
+py4j                      0.10.9.7
+pyarrow                   25.0.1
+pydantic                  2.13.5
+pydantic_core             2.46.5
+pydeck                    0.9.3
+pyspark                   3.5.3
+pytest                    8.3.3
+python-dateutil           2.9.0.post0
+python-dotenv             1.2.2
+python-multipart          0.0.32
+PyYAML                    6.0.3
+referencing               0.37.0
+requests                  2.32.3
+requests-toolbelt         1.0.0
+rpds-py                   2026.6.3
+setuptools                84.0.0
+six                       1.17.0
+sniffio                   1.3.1
+SQLAlchemy                2.0.54
+starlette                 0.46.2
+streamlit                 1.64.0
+tenacity                  9.1.4
+toml                      0.10.2
+truststore                0.10.4
+typing_extensions         4.16.0
+typing-inspection         0.4.4
+tzdata                    2026.4
+urllib3                   2.8.0
+uuid_utils                0.17.1
+uvicorn                   0.34.0
+watchdog                  6.0.0
+watchfiles                1.3.0
+websockets                16.1.1
+wheel                     0.48.0
+xxhash                    4.0.1
+zstandard                 0.25.0"
+
+python -c "import pyspark; print('PySpark:', pyspark.__version__)"
+python -c "import pandas, pyarrow, sqlalchemy, fastapi, streamlit, langgraph, alembic; print('Core dependencies OK')"
+java -version
+$env:JAVA_HOME
+$env:JAVA_HOME="C:\Program Files\Java\jdk-17"
+$env:Path="$env:JAVA_HOME\bin;$env:Path"
+java -version
+echo $env:JAVA_HOME
+$env:JAVA_HOME="C:\Program Files\Microsoft\jdk-17.0.20.101-hotspot"
+$env:Path="$env:JAVA_HOME\bin;$env:Path"
+echo $env:JAVA_HOME
+Test-Path "$env:JAVA_HOME\bin\java.exe"
+& "$env:JAVA_HOME\bin\java.exe" --version
+python -c "from pyspark.sql import SparkSession; s=SparkSession.builder.master('local[2]').appName('test').getOrCreate(); print(s.range(5).count()); s.stop()"
+Get-Service *postgres*
+
+Get-ChildItem "C:\Program Files\PostgreSQL" -Directory
+& "C:\Program Files\PostgreSQL\18\bin\psql.exe" --version
+$env:Path="C:\Program Files\PostgreSQL\18\bin;$env:Path"
+psql --version
+
+psql -U postgres -h localhost -p 5432 -c "CREATE DATABASE industrial_intelligence;"
+alembic upgrade head
+alembic current
+psql -U postgres -h localhost -p 5432 -d industrial_intelligence -c "\dt"
+psql -U postgres -h localhost -p 5432 -d industrial_intelligence -c "SELECT * FROM alembic_version;"
+
+python -c "from sqlalchemy import create_engine,text; e=create_engine('postgresql://postgres:postgres@localhost:5432/industrial_intelligence'); print(e.connect().execute(text('SELECT version()')).scalar())"
+
+Get-ChildItem data\raw
+Get-Content .\spark_jobs\ingestion.py | Select-Object -Skip 25 -First 35
+Get-Content .\spark_jobs\ingestion.py | Select-Object -Skip 115 -First 75
+Get-Content .\scripts\run_pipeline.py | Select-Object -Skip 30 -First 125
+Get-Content .\scripts\load_postgres.py | Select-Object -Skip 115 -First 45
+
+1. Search for synthetic_maintenance.csv
+Get-ChildItem -Path . -Recurse -File -Include *.py |
+    Select-String -Pattern "synthetic_maintenance.csv" |
+    Select-Object Path,LineNumber,Line
+
+2. Search for CSV loading
+Get-ChildItem -Path . -Recurse -File -Include *.py |
+    Select-String -Pattern "read_csv" |
+    Select-Object Path,LineNumber,Line
+
+3. Search for the maintenance filename without the .csv
+Get-ChildItem -Path . -Recurse -File -Include *.py |
+    Select-String -Pattern "synthetic_maintenance" |
+    Select-Object Path,LineNumber,Line
+
+4. Also search for Spark CSV loading
+Get-ChildItem -Path . -Recurse -File -Include *.py |
+    Select-String -Pattern "spark.read.csv|read.option" |
+    Select-Object Path,LineNumber,Line
+
+
+
+Check Phase 01:
+
+Get-ChildItem docker-compose.yml
+python -m pip install -U pip setuptools wheel
+pip install -r requirements.txt
+pip install pytest
+java -version
+
+docker run -d --name iia-pg -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=industrial_intelligence -p 5433:5432 -v "${PWD}/sql:/sql" postgres:16-alpine
+$env:DATABASE_URL="postgresql://postgres:postgres@localhost:5433/industrial_intelligence"
+alembic upgrade head
+docker exec iia-pg sh -c "gunzip -c /sql/seed.sql.gz | psql -U postgres -d industrial_intelligence -q"
+
+
+pytest tests/test_migrations.py tests/test_sensor_onboarding.py tests/test_security_defaults.py tests/test_tenant_isolation.py -q
+pytest tests/test_company_b.py -q
+pytest tests/test_anomaly_rules.py -q

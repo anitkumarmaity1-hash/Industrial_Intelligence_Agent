@@ -1,0 +1,177 @@
+# Industrial Intelligence Agent — Phase 8 demo stack.
+#
+# Brings up: postgres (schema AND seed data auto-applied on first start),
+# api, frontend. `docker compose up` alone is enough — Postgres's own
+# entrypoint runs every file under docker-entrypoint-initdb.d/ in name
+# order on an empty data directory: 01-schema.sql creates the tables,
+# 02-seed.sql.gz (gunzipped automatically — the official image supports
+# .sql.gz init files) loads the exact rows produced by the Phase 1
+# PySpark pipeline + scripts/load_postgres.py (18 machines, 25,920
+# sensor_summary rows, 7 maintenance records, 10,000 AI4I reference rows).
+# A recruiter cloning this repo gets a populated
+# API on the first `docker compose up`, no separate load step, no local
+# Python/pandas/JVM needed for the Docker path.
+#
+# Audit F9: sql/seed.sql.gz was regenerated AFTER the rolling-window fix in
+# spark_jobs/feature_engineering.py, so it holds the fixed pipeline's output:
+# 28,855 machine_anomalies rows (the number tests/test_postgres.py asserts).
+# Re-run "Regenerating the seed" below whenever the pipeline output changes.
+#
+# Deliberately NOT included: a loader *service* for
+# scripts/load_postgres.py. That script needs pandas/pyarrow to read
+# data/processed/*.parquet, which is exactly the weight
+# requirements-runtime.txt exists to keep out of the api image (see that
+# file's comment). Re-running the loader is only needed if you regenerate
+# the pipeline output and want the seed refreshed — see "Regenerating the
+# seed" below — so it stays a manual, dev-machine step from your existing
+# local venv, not a container in this stack. Adding a throwaway loader
+# container here for a single `python scripts/...` call would be the
+# over-engineering the master prompt explicitly says to avoid.
+#
+# Usage — local/offline demo (no cloud credentials or cloud deps):
+#   cp .env.example .env              # then SET POSTGRES_PASSWORD, APP_DB_PASSWORD and API_KEY in it
+#   docker compose up --build
+#
+# Phase 1 security defaults: there are no built-in database credentials any
+# more. `docker compose up` refuses to start until POSTGRES_PASSWORD (and
+# API_KEY, below) are set — see the ${VAR:?message} entries. The api talks
+# to a non-local database host (`postgres`), so AUTH_REQUIRED defaults to
+# true: every data route needs the X-API-Key, and the bundled frontend is
+# given the same API_KEY. The API key reaches the demo tenant only; create
+# per-company keys with scripts/manage_tenants.py. Postgres is published on
+# 127.0.0.1 only.
+#   API:       http://localhost:8000/docs
+#   Frontend:  http://localhost:8501
+#
+# Resetting the DB (e.g. after a schema change): `docker compose down -v`
+# removes the pgdata volume so the next `up` re-runs both init scripts.
+#
+# Regenerating the seed after changing the synthetic data generator or
+# the pipeline: run scripts/run_pipeline.py + scripts/load_postgres.py
+# against a Postgres instance as usual, then:
+#   pg_dump --data-only --disable-triggers "$DATABASE_URL" | gzip -9 > sql/seed.sql.gz
+#
+# Usage — Pinecone + Vertex AI demo (Phase 9 fix: this now actually works.
+# Previously requirements-runtime.txt never got google-genai/pinecone
+# installed no matter what you set below, so this path silently stayed on
+# local/deterministic even with credentials in the environment):
+#   INSTALL_CLOUD_DEPS=true RAG_BACKEND=pinecone GEMINI_SYNTHESIS_ENABLED=true \
+#   PINECONE_API_KEY=... GOOGLE_CLOUD_PROJECT=... \
+#   GOOGLE_APPLICATION_CREDENTIALS_HOST=/absolute/path/to/key.json \
+#   docker compose up --build
+#   (Put these in .env instead of your shell if you'd rather not repeat them
+#   every run — docker compose reads .env automatically. Never commit it.)
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env (see .env.example)}
+      POSTGRES_DB: ${POSTGRES_DB:-industrial_intelligence}
+      # Phase 2 (RLS): login password for the API's least-privilege role
+      # `iia_app`, set by docker/03-app-role.sh. Required, no default.
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?Set APP_DB_PASSWORD in .env (see .env.example)}
+    ports:
+      # Host 5433 -> container 5432, so this doesn't collide with a
+      # Postgres already running on your machine's default 5432. Bound to
+      # loopback: the database is not reachable from other machines.
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Both applied automatically, once, on an empty data directory only,
+      # in filename order (schema before seed). Re-running `docker compose
+      # up` on an existing volume will NOT re-apply either one — see
+      # "Resetting the DB" above.
+      - ./sql/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./sql/seed.sql.gz:/docker-entrypoint-initdb.d/02-seed.sql.gz:ro
+      - ./docker/03-app-role.sh:/docker-entrypoint-initdb.d/03-app-role.sh:ro
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-industrial_intelligence}" ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Set via INSTALL_CLOUD_DEPS in your shell/.env — see "Usage" above.
+        # Default false: image stays the lean local-only build.
+        INSTALL_CLOUD_DEPS: ${INSTALL_CLOUD_DEPS:-false}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Container-to-container hostname: "postgres", the service name
+      # above — not localhost, and not the host-published 5433 port.
+      # Phase 2 (RLS): the API connects as the least-privilege `iia_app` role,
+      # never as the owner/superuser, so Postgres enforces tenant isolation.
+      # It gets no owner credentials. URL-encode the password if it contains
+      # @ : / # % etc.
+      APP_DATABASE_URL: postgresql://iia_app:${APP_DB_PASSWORD:?Set APP_DB_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-industrial_intelligence}
+      # All of these default to the local/offline path — no external
+      # calls, no credentials required. Override any of them via your
+      # shell or .env (see "Usage" above); you do not need to edit this
+      # file to switch to the cloud path.
+      RAG_BACKEND: ${RAG_BACKEND:-local}
+      GEMINI_SYNTHESIS_ENABLED: ${GEMINI_SYNTHESIS_ENABLED:-false}
+      PINECONE_API_KEY: ${PINECONE_API_KEY:-}
+      PINECONE_INDEX: ${PINECONE_INDEX:-industrial-intelligence}
+      PINECONE_CLOUD: ${PINECONE_CLOUD:-aws}
+      PINECONE_REGION: ${PINECONE_REGION:-us-east-1}
+      PINECONE_NAMESPACE: ${PINECONE_NAMESPACE:-maintenance-docs}
+      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
+      GOOGLE_CLOUD_LOCATION: ${GOOGLE_CLOUD_LOCATION:-us-central1}
+      # Required (Phase 1): the bootstrap key for the demo tenant, which the
+      # frontend below also uses. With a remote database host auth is on by
+      # default, so without a key every request would be a 401.
+      API_KEY: ${API_KEY:?Set API_KEY in .env (any long random string)}
+      # Production-readiness fixes 1-3, 5, 6: unset/empty by default (same
+      # zero-config demo posture as API_KEY above). Set AUTH_REQUIRED=true
+      # to require a key on every data route; CORS_ALLOW_ORIGINS to let a
+      # browser call this API cross-origin; RATE_LIMIT_PER_MINUTE to change
+      # the /investigate and /chat throttle (0 disables it).
+      AUTH_REQUIRED: ${AUTH_REQUIRED:-}
+      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-}
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-30}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-30}
+      LLM_MAX_ATTEMPTS: ${LLM_MAX_ATTEMPTS:-2}
+      GRAPH_RECURSION_LIMIT: ${GRAPH_RECURSION_LIMIT:-40}
+      # Gemini calls (synthesis + planner). Defaults live in app/core/config.py;
+      # Gemini 2.5 Flash is being retired — confirm the model ID in your own
+      # Vertex Model Garden before a live demo.
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.6-flash}
+      PLANNER_MODEL: ${PLANNER_MODEL:-gemini-3.6-flash}
+      GEMINI_LOCATION: ${GEMINI_LOCATION:-global}
+      # Only meaningful when GOOGLE_APPLICATION_CREDENTIALS_HOST (below) is
+      # set — this is the in-container path the volume mount below targets,
+      # never a value you set directly.
+      GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS_HOST:+/run/secrets/gcp-key.json}
+    volumes:
+      # No-op (mounts /dev/null) when GOOGLE_APPLICATION_CREDENTIALS_HOST is
+      # unset. Set it to an absolute host path to a service-account key
+      # file to mount it in — never bake a key into the image or commit one
+      # to the repo.
+      - ${GOOGLE_APPLICATION_CREDENTIALS_HOST:-/dev/null}:/run/secrets/gcp-key.json:ro
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    depends_on:
+      - api
+    environment:
+      # Container-to-container hostname again: "api", not localhost.
+      API_BASE_URL: http://api:8000
+      # Same key as the api service; the sidebar's own "API key" field
+      # overrides this per-session.
+      API_KEY: ${API_KEY:?Set API_KEY in .env}
+    ports:
+      - "8501:8501"
+
+volumes:
+  pgdata:
