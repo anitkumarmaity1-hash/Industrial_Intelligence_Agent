@@ -1,5 +1,7 @@
 # Phase 1 dependencies (data layer).
 pyspark==3.5.3
+# PySpark 3.5 imports distutils (toPandas); Python 3.12 removed it, setuptools supplies it.
+setuptools<81
 pytest==8.3.3
 
 # Phase 2 dependencies (PostgreSQL layer). Later phases will extend this
