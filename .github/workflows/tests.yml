@@ -98,6 +98,12 @@ jobs:
           echo "APP_DATABASE_URL=postgresql://iia_app:${APP_DB_PASSWORD}@localhost:5432/iia" >> "$GITHUB_ENV"
           APP_DB_PASSWORD="$APP_DB_PASSWORD" python scripts/provision_app_role.py
 
+      - name: Generate synthetic raw data (git-ignored, seed=42)
+        # data/raw/synthetic_operational.csv is ignored by .gitignore (too
+        # large to commit), so a fresh clone does not have it. The Spark
+        # tests (test_pipeline.py, test_anomaly_rules.py) read it.
+        run: python scripts/generate_synthetic_data.py
+
       - name: Run tests
         # "load" (production-readiness fix 16) generates/queries ~1M+ rows —
         # genuinely slow, and the point of CI is a fast, reliable signal on
