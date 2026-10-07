@@ -1,4 +1,4 @@
-"""Settings for uploads, object storage and the background worker (Phase 3).
+"""Settings for uploads, file storage and the background worker (Phase 3).
 
 Kept apart from app/core/config.py on purpose: nothing here is needed by the
 agent/RAG side, and the values are read fresh on every call (no cache), so a
@@ -24,14 +24,8 @@ def _int(name: str, default: int) -> int:
 
 @dataclass(frozen=True)
 class IngestSettings:
-    # --- object storage ---------------------------------------------------
-    storage_backend: str          # "local" (default) or "s3" (MinIO / any S3-compatible)
+    # --- file storage -----------------------------------------------------
     storage_local_dir: Path
-    s3_endpoint_url: str | None   # e.g. http://minio:9000 ; None = AWS
-    s3_bucket: str
-    s3_region: str
-    s3_access_key: str | None
-    s3_secret_key: str | None
     # --- uploads ----------------------------------------------------------
     upload_max_bytes: int
     upload_rate_limit_per_minute: int
@@ -46,18 +40,9 @@ class IngestSettings:
 
 
 def ingest_settings() -> IngestSettings:
-    backend = (_env("STORAGE_BACKEND", "local") or "local").lower()
-    if backend not in ("local", "s3"):
-        raise ValueError(f"STORAGE_BACKEND must be 'local' or 's3', got {backend!r}")
     local_dir = Path(_env("STORAGE_LOCAL_DIR", str(PROJECT_ROOT / "data" / "storage")))
     return IngestSettings(
-        storage_backend=backend,
         storage_local_dir=local_dir,
-        s3_endpoint_url=_env("S3_ENDPOINT_URL"),
-        s3_bucket=_env("S3_BUCKET", "iia-uploads") or "iia-uploads",
-        s3_region=_env("S3_REGION", "us-east-1") or "us-east-1",
-        s3_access_key=_env("S3_ACCESS_KEY_ID"),
-        s3_secret_key=_env("S3_SECRET_ACCESS_KEY"),
         upload_max_bytes=_int("UPLOAD_MAX_BYTES", 50 * 1024 * 1024),
         upload_rate_limit_per_minute=_int("UPLOAD_RATE_LIMIT_PER_MINUTE", 20),
         preview_max_rows=_int("PREVIEW_MAX_ROWS", 50),

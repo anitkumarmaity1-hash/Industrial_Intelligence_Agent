@@ -10,5 +10,3 @@ pandas==3.0.2
 SQLAlchemy==2.0.54
 psycopg2-binary==2.9.13
 python-dotenv==1.2.2
-# Object storage (S3 / MinIO provider). Also in requirements.txt and requirements-runtime.txt.
-boto3==1.43.108

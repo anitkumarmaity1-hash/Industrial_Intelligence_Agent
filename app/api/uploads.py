@@ -11,9 +11,8 @@
     POST /jobs/{id}/retry              failed jobs only
 
 Why a streamed POST and not a presigned PUT: the Streamlit frontend uploads
-server-to-server, so a browser-facing presigned URL buys nothing, would need PUT
-in the CORS allow-list and MinIO reachable from browsers, and could not enforce
-the size cap. The body is read in chunks into a bounded spool, hashed, and handed
+server-to-server, and a direct-to-storage upload could not enforce the size cap.
+The body is read in chunks into a bounded spool, hashed, and handed
 to the StorageProvider; no multipart parser (and no extra dependency) is involved.
 
 Every route is tenant-scoped through get_tenant, requires a real API key (an

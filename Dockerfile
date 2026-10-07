@@ -41,6 +41,11 @@ RUN pip install --no-cache-dir -r requirements-runtime.txt \
 # Application code.
 COPY app/ ./app/
 
+# app/core/anomaly_rules.py (imported by the upload routes) reads the thresholds in
+# spark_jobs/config.py, which is plain Python. Only that module and the package marker
+# are copied: the rest of spark_jobs/ imports PySpark, which this image does not have.
+COPY spark_jobs/__init__.py spark_jobs/config.py ./spark_jobs/
+
 # Runtime data the RAG retriever reads directly off disk (BM25 over the
 # pre-chunked, pre-committed JSONL — see app/rag/retriever.py). Nothing
 # else under data/ (raw/, sample/, the parquet dirs) is read at request
@@ -52,8 +57,9 @@ COPY data/processed/document_chunks.jsonl ./data/processed/document_chunks.jsonl
 # — it limits blast radius if a dependency vulnerability or an injection
 # in a future feature ever led to arbitrary code execution inside this
 # container. /srv is chowned to it so app code (already COPYed as root
-# above) is still readable.
-RUN useradd --create-home --uid 1000 appuser && chown -R appuser:appuser /srv
+# above) is still readable. /srv/data/storage is created here, owned by that
+# user, so the shared upload volume mounted there is writable (Phase 3).
+RUN mkdir -p /srv/data/storage && useradd --create-home --uid 1000 appuser && chown -R appuser:appuser /srv
 USER appuser
 
 # Un-set by default: app/core/config.py treats a missing DATABASE_URL as

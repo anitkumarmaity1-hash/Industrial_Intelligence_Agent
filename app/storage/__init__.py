@@ -1,8 +1,9 @@
 """Object storage for uploaded files (Phase 3, task 1).
 
-Two providers behind one small interface: `LocalStorage` (default; also what
-the tests use) and `S3Storage` (MinIO in docker-compose for dev, or any
-S3-compatible service). Object keys are NEVER taken from a client:
+Files live on the local filesystem (`LocalStorage`; in docker-compose a volume
+shared by the api and worker containers) behind one small `StorageProvider`
+interface, so another backend can be added later. Object keys are NEVER taken
+from a client:
 
     tenants/<tenant_id>/uploads/<upload_id>/data.csv
 
@@ -61,9 +62,5 @@ class StorageProvider(Protocol):
 
 def get_storage() -> StorageProvider:
     from app.core.ingest_settings import ingest_settings
-    s = ingest_settings()
-    if s.storage_backend == "s3":
-        from app.storage.s3 import S3Storage
-        return S3Storage.from_settings(s)
     from app.storage.local import LocalStorage
-    return LocalStorage(s.storage_local_dir)
+    return LocalStorage(ingest_settings().storage_local_dir)

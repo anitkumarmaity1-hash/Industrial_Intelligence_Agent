@@ -60,5 +60,4 @@ requests==2.32.3
 # Phase 1 mapping dry-run (app/onboarding/sensors.py) on a sample. pyarrow and PySpark
 # stay out: the worker image (requirements-worker.txt) is where Spark runs.
 pandas==3.0.2
-# S3/MinIO object-storage provider (imported lazily; unused with STORAGE_BACKEND=local).
-boto3==1.43.108
+

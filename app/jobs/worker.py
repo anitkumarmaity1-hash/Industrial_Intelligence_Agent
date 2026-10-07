@@ -129,9 +129,7 @@ def main(argv: list[str] | None = None) -> int:
     s = ingest_settings()
     engine = make_engine()
     storage = get_storage()
-    if hasattr(storage, "ensure_bucket"):
-        storage.ensure_bucket()
-    logger.info("worker started (storage=%s, poll=%ss)", s.storage_backend, s.worker_poll_seconds)
+    logger.info("worker started (storage=%s, poll=%ss)", s.storage_local_dir, s.worker_poll_seconds)
 
     last_reap = 0.0
     while not _stop:
