@@ -30,6 +30,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.api.routes import router
+from app.api.uploads import router as uploads_router
 from app.core.config import database_is_remote, get_settings
 from app.core.logging_config import setup_logging
 from app.core.request_context import set_request_id
@@ -118,6 +119,7 @@ if _cors_origins:
     )
 
 app.include_router(router)
+app.include_router(uploads_router)
 
 
 # Production-readiness fix 14: every request gets a request ID — reused

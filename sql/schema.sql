@@ -1,4 +1,4 @@
--- Industrial Intelligence Agent — schema (multi-tenant since 0002; generic sensors 0005; row-level security 0006)
+-- Industrial Intelligence Agent — schema (multi-tenant since 0002; generic sensors 0005; row-level security 0006; uploads/jobs 0007)
 --
 -- Reflects what the Phase 1 PySpark pipeline actually produces (verified
 -- against data/processed/*.parquet), not the original Phase 0 sketch.
@@ -51,7 +51,7 @@ INSERT INTO tenants (tenant_id, name) VALUES ('default', 'Demo tenant (synthetic
 CREATE TABLE machines (
     tenant_id        VARCHAR(48)  NOT NULL DEFAULT 'default' REFERENCES tenants(tenant_id),
     machine_id       VARCHAR(64)  NOT NULL,
-    production_line  VARCHAR(20)  NOT NULL,
+    production_line  VARCHAR(100) NOT NULL,
     -- NULL for fleets with no AI4I quality variant (0005); non-NULL must still be L/M/H.
     type             CHAR(1)      CHECK (type IN ('L', 'M', 'H')),
     name             VARCHAR(100),
@@ -142,6 +142,8 @@ CREATE TABLE machine_anomalies (
     severity            VARCHAR(10) NOT NULL CHECK (severity IN ('MEDIUM', 'HIGH')),
     triggered_reasons   TEXT,
     PRIMARY KEY (detected_at, id),
+    -- 0007: one anomaly per (tenant, machine, timestamp), so re-running an upload is idempotent.
+    CONSTRAINT uq_machine_anomalies_tenant_machine_detected UNIQUE (tenant_id, machine_id, detected_at),
     FOREIGN KEY (tenant_id, machine_id) REFERENCES machines (tenant_id, machine_id)
 ) PARTITION BY RANGE (detected_at);
 -- Partitioned like sensor_summary (fix 13); PK includes the partition key.
@@ -333,6 +335,92 @@ CREATE TABLE sensor_readings_default PARTITION OF sensor_readings DEFAULT;
 CREATE INDEX idx_sensor_readings_tenant_ts ON sensor_readings (tenant_id, ts);
 
 -- ---------------------------------------------------------------------
+-- uploads, jobs, rejected_rows (0007, Phase 3): tenant file uploads, the Postgres-backed
+-- job queue (iia_claim_job: FOR UPDATE SKIP LOCKED) and per-row rejection reasons.
+-- ---------------------------------------------------------------------
+CREATE TABLE uploads (
+    upload_id     UUID         PRIMARY KEY,
+    tenant_id     VARCHAR(48)  NOT NULL REFERENCES tenants(tenant_id),
+    filename      VARCHAR(255) NOT NULL,
+    content_type  VARCHAR(100) NOT NULL,
+    storage_key   VARCHAR(300) NOT NULL,
+    status        VARCHAR(20)  NOT NULL DEFAULT 'created'
+                  CHECK (status IN ('created', 'uploaded', 'mapped')),
+    size_bytes    BIGINT,
+    sha256        CHAR(64),
+    mapping       JSONB,
+    created_at    TIMESTAMP    NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC'),
+    updated_at    TIMESTAMP    NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC'),
+    UNIQUE (tenant_id, upload_id)
+);
+CREATE INDEX idx_uploads_tenant_created ON uploads (tenant_id, created_at);
+
+CREATE TABLE jobs (
+    job_id         UUID         PRIMARY KEY,
+    tenant_id      VARCHAR(48)  NOT NULL REFERENCES tenants(tenant_id),
+    upload_id      UUID         NOT NULL,
+    type           VARCHAR(30)  NOT NULL DEFAULT 'sensor_ingest' CHECK (type IN ('sensor_ingest')),
+    status         VARCHAR(20)  NOT NULL DEFAULT 'queued'
+                   CHECK (status IN ('queued', 'running', 'succeeded', 'failed')),
+    stage          VARCHAR(20),
+    created_at     TIMESTAMP    NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC'),
+    started_at     TIMESTAMP,
+    finished_at    TIMESTAMP,
+    locked_at      TIMESTAMP,
+    run_after      TIMESTAMP    NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC'),
+    rows_in        BIGINT       NOT NULL DEFAULT 0,
+    rows_loaded    BIGINT       NOT NULL DEFAULT 0,
+    rows_rejected  BIGINT       NOT NULL DEFAULT 0,
+    error          TEXT,
+    retry_count    INTEGER      NOT NULL DEFAULT 0,
+    max_retries    INTEGER      NOT NULL DEFAULT 3,
+    UNIQUE (tenant_id, job_id),
+    FOREIGN KEY (tenant_id, upload_id) REFERENCES uploads (tenant_id, upload_id)
+);
+CREATE INDEX idx_jobs_tenant_created ON jobs (tenant_id, created_at);
+CREATE INDEX idx_jobs_queue ON jobs (run_after) WHERE status = 'queued';
+
+CREATE TABLE rejected_rows (
+    id          BIGSERIAL    PRIMARY KEY,
+    tenant_id   VARCHAR(48)  NOT NULL REFERENCES tenants(tenant_id),
+    job_id      UUID         NOT NULL,
+    row_number  INTEGER,
+    code        VARCHAR(40)  NOT NULL,
+    reason      TEXT         NOT NULL,
+    raw         JSONB,
+    FOREIGN KEY (tenant_id, job_id) REFERENCES jobs (tenant_id, job_id) ON DELETE CASCADE
+);
+CREATE INDEX idx_rejected_rows_job ON rejected_rows (tenant_id, job_id, id);
+CREATE FUNCTION iia_claim_job() RETURNS TABLE (job_id uuid, tenant_id varchar)
+LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, public AS $fn$
+    UPDATE public.jobs j
+       SET status = 'running', stage = 'claimed', started_at = (NOW() AT TIME ZONE 'UTC'),
+           locked_at = (NOW() AT TIME ZONE 'UTC'), finished_at = NULL
+     WHERE j.job_id = (
+        SELECT q.job_id FROM public.jobs q
+         WHERE q.status = 'queued' AND q.run_after <= (NOW() AT TIME ZONE 'UTC')
+         ORDER BY q.run_after, q.created_at
+         FOR UPDATE SKIP LOCKED LIMIT 1)
+    RETURNING j.job_id, j.tenant_id
+$fn$;
+
+CREATE FUNCTION iia_reap_stale_jobs(p_stale_seconds integer) RETURNS integer
+LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, public AS $fn$
+    WITH r AS (
+        UPDATE public.jobs j
+           SET status = CASE WHEN j.retry_count >= j.max_retries THEN 'failed' ELSE 'queued' END,
+               retry_count = CASE WHEN j.retry_count >= j.max_retries
+                                  THEN j.retry_count ELSE j.retry_count + 1 END,
+               error = 'worker lost (no heartbeat for ' || p_stale_seconds || 's)',
+               locked_at = NULL, run_after = (NOW() AT TIME ZONE 'UTC'),
+               finished_at = CASE WHEN j.retry_count >= j.max_retries THEN (NOW() AT TIME ZONE 'UTC') END
+         WHERE j.status = 'running'
+           AND j.locked_at < (NOW() AT TIME ZONE 'UTC') - make_interval(secs => p_stale_seconds)
+        RETURNING 1)
+    SELECT COUNT(*)::integer FROM r
+$fn$;
+
+-- ---------------------------------------------------------------------
 -- Row-level security (0006, Phase 2): tenant isolation enforced by Postgres.
 -- Policies compare tenant_id with the transaction-local setting
 -- `app.tenant_id` (app/database/tenant_context.py); unset = no rows, writes
@@ -367,15 +455,34 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'iia_app') THEN
         CREATE ROLE iia_app NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;
     END IF;
-    REVOKE ALL ON ALL TABLES IN SCHEMA public FROM iia_app;
-    REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM iia_app;
-    GRANT USAGE ON SCHEMA public TO iia_app;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'iia_worker') THEN
+        CREATE ROLE iia_worker NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;
+    END IF;
+    REVOKE ALL ON ALL TABLES IN SCHEMA public FROM iia_app, iia_worker;
+    REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM iia_app, iia_worker;
+    GRANT USAGE ON SCHEMA public TO iia_app, iia_worker;
+    -- API role: reads, the audit log, and the upload/job records it creates.
     GRANT SELECT ON machines, sensor_summary, machine_anomalies, maintenance_records,
-        sensor_registry, sensor_readings, tenant_settings, ai4i_reference TO iia_app;
+        sensor_registry, sensor_readings, tenant_settings, ai4i_reference,
+        rejected_rows TO iia_app;
+    GRANT SELECT, INSERT, UPDATE ON uploads, jobs TO iia_app;
     GRANT INSERT ON investigation_audit_log TO iia_app;
     GRANT USAGE ON SEQUENCE investigation_audit_log_id_seq TO iia_app;
     REVOKE ALL ON FUNCTION auth_lookup_tenant(text) FROM PUBLIC;
     GRANT EXECUTE ON FUNCTION auth_lookup_tenant(text) TO iia_app;
+    -- Worker role: writes the ingest pipeline's outputs, nothing else.
+    GRANT SELECT ON ai4i_reference TO iia_worker;
+    GRANT SELECT, UPDATE ON uploads, jobs TO iia_worker;
+    GRANT SELECT, INSERT, DELETE ON rejected_rows TO iia_worker;
+    GRANT SELECT, INSERT, UPDATE ON machines, sensor_registry, tenant_settings,
+        sensor_summary, machine_anomalies, ingestion_checkpoints TO iia_worker;
+    GRANT SELECT, INSERT ON sensor_readings TO iia_worker;
+    GRANT USAGE ON SEQUENCE sensor_summary_id_seq, machine_anomalies_id_seq,
+        rejected_rows_id_seq TO iia_worker;
+    REVOKE ALL ON FUNCTION iia_claim_job() FROM PUBLIC;
+    REVOKE ALL ON FUNCTION iia_reap_stale_jobs(integer) FROM PUBLIC;
+    GRANT EXECUTE ON FUNCTION iia_claim_job() TO iia_worker;
+    GRANT EXECUTE ON FUNCTION iia_reap_stale_jobs(integer) TO iia_worker;
     REVOKE ALL ON FUNCTION iia_enable_tenant_rls(regclass) FROM PUBLIC;
     REVOKE ALL ON FUNCTION iia_grant_app_privileges() FROM PUBLIC;
 END
@@ -391,6 +498,11 @@ SELECT iia_enable_tenant_rls('tenant_settings');
 SELECT iia_enable_tenant_rls('tenant_schema_mappings');
 SELECT iia_enable_tenant_rls('investigation_audit_log');
 SELECT iia_enable_tenant_rls('ingestion_checkpoints');
+SELECT iia_enable_tenant_rls('uploads');
+SELECT iia_enable_tenant_rls('rejected_rows');
+-- jobs: ENABLE only, not FORCE (0007): the SECURITY DEFINER claim/reap functions run as the owner.
+ALTER TABLE jobs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON jobs USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')) WITH CHECK (tenant_id = NULLIF(current_setting('app.tenant_id', true), ''));
 SELECT iia_enable_tenant_rls(relid) FROM pg_partition_tree('sensor_summary') WHERE isleaf;
 SELECT iia_enable_tenant_rls(relid) FROM pg_partition_tree('machine_anomalies') WHERE isleaf;
 SELECT iia_enable_tenant_rls(relid) FROM pg_partition_tree('sensor_readings') WHERE isleaf;

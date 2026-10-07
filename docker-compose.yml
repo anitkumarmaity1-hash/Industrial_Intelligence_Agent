@@ -72,6 +72,9 @@ services:
       # Phase 2 (RLS): login password for the API's least-privilege role
       # `iia_app`, set by docker/03-app-role.sh. Required, no default.
       APP_DB_PASSWORD: ${APP_DB_PASSWORD:?Set APP_DB_PASSWORD in .env (see .env.example)}
+      # Phase 3: login password for the background worker's role `iia_worker`
+      # (same script). Required, no default.
+      WORKER_DB_PASSWORD: ${WORKER_DB_PASSWORD:?Set WORKER_DB_PASSWORD in .env (see .env.example)}
     ports:
       # Host 5433 -> container 5432, so this doesn't collide with a
       # Postgres already running on your machine's default 5432. Bound to
@@ -102,6 +105,8 @@ services:
         INSTALL_CLOUD_DEPS: ${INSTALL_CLOUD_DEPS:-false}
     depends_on:
       postgres:
+        condition: service_healthy
+      minio:
         condition: service_healthy
     environment:
       # Container-to-container hostname: "postgres", the service name
@@ -149,6 +154,15 @@ services:
       # set — this is the in-container path the volume mount below targets,
       # never a value you set directly.
       GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS_HOST:+/run/secrets/gcp-key.json}
+      # Phase 3 (uploads): files go to MinIO; the worker below reads them from there.
+      STORAGE_BACKEND: s3
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_BUCKET: ${S3_BUCKET:-iia-uploads}
+      S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER in .env (see .env.example)}
+      S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in .env (see .env.example)}
+      UPLOAD_MAX_BYTES: ${UPLOAD_MAX_BYTES:-52428800}
+      UPLOAD_RATE_LIMIT_PER_MINUTE: ${UPLOAD_RATE_LIMIT_PER_MINUTE:-20}
+      JOB_MAX_RETRIES: ${JOB_MAX_RETRIES:-3}
     volumes:
       # No-op (mounts /dev/null) when GOOGLE_APPLICATION_CREDENTIALS_HOST is
       # unset. Set it to an absolute host path to a service-account key
@@ -157,6 +171,52 @@ services:
       - ${GOOGLE_APPLICATION_CREDENTIALS_HOST:-/dev/null}:/run/secrets/gcp-key.json:ro
     ports:
       - "8000:8000"
+
+  # Phase 3: S3-compatible object storage for uploaded files (dev; any S3 API works
+  # in production). Console on 127.0.0.1:9001. The bucket is created on first use.
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER in .env (see .env.example)}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in .env (see .env.example)}
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: [ "CMD", "mc", "ready", "local" ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Phase 3: the background worker. Polls the Postgres job queue (SELECT .. FOR UPDATE
+  # SKIP LOCKED) and runs validate -> map -> normalize -> load -> detect (Spark local
+  # mode, hence the JVM in this image) -> store. Connects as the least-privilege
+  # `iia_worker` role, never the owner. Scale with `docker compose up --scale worker=2`.
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      WORKER_DATABASE_URL: postgresql://iia_worker:${WORKER_DB_PASSWORD:?Set WORKER_DB_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-industrial_intelligence}
+      STORAGE_BACKEND: s3
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_BUCKET: ${S3_BUCKET:-iia-uploads}
+      S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER in .env}
+      S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in .env}
+      UPLOAD_MAX_BYTES: ${UPLOAD_MAX_BYTES:-52428800}
+      JOB_MAX_RETRIES: ${JOB_MAX_RETRIES:-3}
+      JOB_BACKOFF_BASE_SECONDS: ${JOB_BACKOFF_BASE_SECONDS:-5}
+      JOB_STALE_SECONDS: ${JOB_STALE_SECONDS:-300}
+      WORKER_POLL_SECONDS: ${WORKER_POLL_SECONDS:-2}
+    restart: unless-stopped
 
   frontend:
     build:
@@ -175,3 +235,4 @@ services:
 
 volumes:
   pgdata:
+  miniodata:

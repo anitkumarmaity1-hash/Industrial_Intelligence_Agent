@@ -36,4 +36,4 @@ documents/
 .git/
 .gitignore
 README.md
-tests/
+tests/data/storage

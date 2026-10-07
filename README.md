@@ -24,6 +24,7 @@ FastAPI + Streamlit application, containerized with Docker.
 - [API](#api)
 - [Multi-tenancy](#multi-tenancy)
 - [Onboarding a tenant's own data](#onboarding-a-tenants-own-data)
+- [Uploads and the background worker](#uploads-and-the-background-worker)
 - [Setup](#setup)
 - [Example investigation](#example-investigation)
 - [Testing](#testing)
@@ -291,6 +292,25 @@ conflicting duplicate, unmapped type). The file is rejected unless
 (`tests/test_anomaly_rules.py` compares against the committed parquet exactly).
 The legacy AI4I-shaped path above is unchanged.
 
+## Uploads and the background worker
+
+A tenant can onboard a CSV through the API instead of the CLI (Phase 3). Every route needs the tenant's API key (anonymous demo requests get 401), is tenant-scoped and rate limited (`UPLOAD_RATE_LIMIT_PER_MINUTE`, per tenant).
+
+```
+POST /uploads                     {"filename": "export.csv"}            -> upload record
+POST /uploads/{id}/content        raw CSV body, Content-Type: text/csv  -> stored (max UPLOAD_MAX_BYTES)
+POST /uploads/{id}/preview        {"rows": 10}                          -> columns + detected types + first rows
+POST /uploads/{id}/mapping        {"mapping": {...}, "confirm": false}  -> dry-run report on a sample
+POST /uploads/{id}/mapping        {"mapping": {...}, "confirm": true}   -> stores the mapping, queues a job
+GET  /jobs, /jobs/{id}, /jobs/{id}/rejected-rows        POST /jobs/{id}/retry   (failed jobs only)
+```
+
+The mapping is the Phase 1 sensor mapping (`app/onboarding/sensors.py`) and the report is its per-row `NormalizationReport`; there is no second mapping system. `curl --data-binary @export.csv -H "Content-Type: text/csv" -H "X-API-Key: ..." .../uploads/{id}/content` is a complete client.
+
+The worker (`python -m app.jobs.worker`, the `worker` compose service) claims jobs from Postgres with `FOR UPDATE SKIP LOCKED` and runs **validate → map → normalize → load → detect → store**, updating `jobs.stage` at each step. Detection is the existing Spark `detect()` in local mode, over the tenant's stored readings from each machine's first uploaded timestamp (plus the rolling-window baseline before it), so a second upload continues the first one's baseline. Re-running an upload, or retrying after a crash, creates no duplicates (readings, summaries and anomalies are all upserts). Bad rows are dropped and listed in `rejected_rows` with a reason and the raw row; a file with no usable rows fails. Transient failures are retried with exponential backoff (`JOB_MAX_RETRIES`); a worker that dies is detected by a stale heartbeat and its job re-queued.
+
+Files live under `tenants/<tenant_id>/uploads/<upload_id>/` in the configured `StorageProvider` (local filesystem by default, S3/MinIO with `STORAGE_BACKEND=s3`). Keys are generated server-side; no request field names a key, and no response exposes one. The API connects as `iia_app` and the worker as `iia_worker`, both subject to row-level security.
+
 ## Setup
 
 ### Local (no Docker)
@@ -395,6 +415,7 @@ sharing this as a portfolio piece.*
 - **PySpark needs a local JVM.** `pytest -m "not dense"` will show `JAVA_GATEWAY_EXITED` errors on `tests/test_pipeline.py` if Java 8/11/17 isn't installed and on `PATH`/`JAVA_HOME`; this is an environment requirement, not a code bug.
 - **Risk thresholds are calibrated on synthetic data.** The 25%/5% sustained-rate cutoffs in `app/agents/risk.py` are tunable starting points validated against this project's injected scenarios, not clinically/industrially validated limits.
 - **Generic-sensor engine limits (Phase 1).** Composite failure rules exist only for the AI4I pack; other tenants get per-sensor z-score and range rules. There is no minimum baseline, so a machine's first readings can false-flag; the rolling window counts readings, not wall-clock time; sparse sensors yield NULLs (treated as not-flagged). Hourly per-sensor aggregates are only stored for AI4I columns, so `/machines/{id}/sensors` trends and the dashboard remain AI4I-oriented (use `/machines/{id}/readings` for other sensors). Spark reads onboarding files, not Postgres via JDBC.
+- **Uploads and worker (Phase 3).** Sensor-readings CSV only (the maintenance/legacy AI4I formats still use the CLI). The S3/MinIO provider and the `worker`/`minio` compose services are tested only against a fake S3 client, not a real MinIO or a built image (no Docker daemon was available). Uploading older data after newer data re-detects from the older start, but an anomaly that no longer fires after a re-run is not deleted. The first 5,000 rows are all the mapping dry-run checks; the job validates the whole file. An existing reading with the same (machine, sensor, timestamp) keeps its first value; `rows_loaded` counts accepted readings, new or already present. Spark runs in the worker's JVM, so a job costs a few seconds of startup and memory proportional to the machines' stored history from the upload start. No per-role rules yet (Phase 4): any tenant key may upload.
 - **Not verified:** `docker compose up` (only `docker compose config`), the ~2.5M-row `--ai4i-demo` long-format load, and `-m dense` tests.
 - **Docs referenced a `manage_tenants.py calibrate` command that does not exist.** Tenant anomaly settings are written via `queries.merge_tenant_anomaly_settings` (no CLI yet).
 - **Docker's cloud path is opt-in and unverified end-to-end in this repo's automated tests** — `pytest -m dense` and a real `docker compose up` with real credentials are the only ways to confirm the Pinecone/Vertex path actually returns different output than the local path.

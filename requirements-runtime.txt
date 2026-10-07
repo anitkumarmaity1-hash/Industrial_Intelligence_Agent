@@ -54,3 +54,11 @@ requests==2.32.3
 # `pip install -r requirements-cloud.txt` to the Dockerfile and supply
 # GOOGLE_APPLICATION_CREDENTIALS via a mounted volume — do not bake a
 # service-account key into the image.
+
+# --- Phase 3: uploads ------------------------------------------------------
+# pandas (+ numpy, its dependency): the API now previews uploaded CSVs and runs the
+# Phase 1 mapping dry-run (app/onboarding/sensors.py) on a sample. pyarrow and PySpark
+# stay out: the worker image (requirements-worker.txt) is where Spark runs.
+pandas==3.0.2
+# S3/MinIO object-storage provider (imported lazily; unused with STORAGE_BACKEND=local).
+boto3==1.43.108

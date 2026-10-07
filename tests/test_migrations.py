@@ -227,7 +227,7 @@ def test_0005_keeps_rows_widens_ids_and_downgrades_cleanly(scratch_db):
 
 def test_0006_rls_upgrade_and_downgrade_round_trip(scratch_db):
     cfg = _alembic(scratch_db)
-    command.upgrade(cfg, "head")
+    command.upgrade(cfg, "0006")
     engine = create_engine(scratch_db)
     with engine.connect() as c:
         on = c.execute(text(
@@ -244,4 +244,49 @@ def test_0006_rls_upgrade_and_downgrade_round_trip(scratch_db):
         assert c.execute(text(
             "SELECT has_table_privilege('iia_app', 'machines', 'SELECT')")).scalar() is False
     command.upgrade(cfg, "head")   # and back again
+    engine.dispose()
+
+
+def test_0007_uploads_jobs_round_trip_and_guards(scratch_db):
+    cfg = _alembic(scratch_db)
+    command.upgrade(cfg, "0006")
+    engine = create_engine(scratch_db)
+    with engine.begin() as c:
+        c.execute(text("INSERT INTO machines (tenant_id, machine_id, production_line, type) "
+                       "VALUES ('default', 'M1', 'L1', 'L')"))
+        c.execute(text("INSERT INTO machine_anomalies (tenant_id, machine_id, detected_at, anomaly_score, severity) "
+                       "VALUES ('default','M1','2026-01-01',1,'MEDIUM'),('default','M1','2026-01-01',2,'HIGH')"))
+    # guard: duplicate anomalies block the unique key
+    with pytest.raises(RuntimeError, match="Refusing to upgrade"):
+        command.upgrade(cfg, "0007")
+    with engine.begin() as c:
+        c.execute(text("DELETE FROM machine_anomalies WHERE anomaly_score = 2"))
+    command.upgrade(cfg, "0007")
+    with engine.connect() as c:
+        assert c.execute(text("SELECT character_maximum_length FROM information_schema.columns "
+                              "WHERE table_name='machines' AND column_name='production_line'")).scalar() == 100
+        for t in ("uploads", "jobs", "rejected_rows"):
+            assert c.execute(text("SELECT relrowsecurity FROM pg_class WHERE relname = :t"), {"t": t}).scalar()
+        assert c.execute(text("SELECT has_table_privilege('iia_worker', 'sensor_readings', 'INSERT')")).scalar()
+        assert not c.execute(text("SELECT has_table_privilege('iia_app', 'sensor_readings', 'INSERT')")).scalar()
+    # guard: stored uploads block the downgrade
+    with engine.begin() as c:
+        c.execute(text("INSERT INTO uploads (upload_id, tenant_id, filename, content_type, storage_key) VALUES "
+                       "('00000000-0000-0000-0000-000000000001','default','a.csv','text/csv','tenants/default/uploads/x/data.csv')"))
+    with pytest.raises(RuntimeError, match="Refusing to downgrade"):
+        command.downgrade(cfg, "0006")
+    with engine.begin() as c:
+        c.execute(text("DELETE FROM uploads"))
+    # guard: a production_line the old width cannot hold
+    with engine.begin() as c:
+        c.execute(text("UPDATE machines SET production_line = :p"), {"p": "L" * 40})
+    with pytest.raises(RuntimeError, match="Refusing to downgrade"):
+        command.downgrade(cfg, "0006")
+    with engine.begin() as c:
+        c.execute(text("UPDATE machines SET production_line = 'L1'"))
+    command.downgrade(cfg, "0006")
+    with engine.connect() as c:
+        assert c.execute(text("SELECT to_regclass('jobs')")).scalar() is None
+        assert c.execute(text("SELECT to_regproc('iia_claim_job')")).scalar() is None
+    command.upgrade(cfg, "head")
     engine.dispose()

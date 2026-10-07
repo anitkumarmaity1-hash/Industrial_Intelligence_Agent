@@ -40,6 +40,8 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
+_UTC_NOW = "(NOW() AT TIME ZONE 'UTC')"
+
 
 def list_machines(conn: Connection, *, tenant_id: str) -> list[dict[str, Any]]:
     """All machines in the tenant's fleet with static metadata. Backs GET /machines."""
@@ -602,3 +604,337 @@ def get_tenant_by_key_hash(conn: Connection, api_key_hash: str) -> dict[str, Any
         {"api_key_hash": api_key_hash},
     ).mappings().first()
     return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------
+# Uploads, jobs, rejected rows (migration 0007, Phase 3)
+# ---------------------------------------------------------------------
+# The API reads/creates these through its tenant-bound connection; the worker
+# uses the same functions after claiming a job (the claim itself is the one
+# cross-tenant step and lives in app/jobs/worker.py, as a SECURITY DEFINER call).
+
+_UPLOAD_COLS = ("upload_id, filename, content_type, storage_key, status, size_bytes, sha256, "
+                "mapping, created_at, updated_at")
+_JOB_COLS = ("job_id, upload_id, type, status, stage, created_at, started_at, finished_at, "
+             "run_after, rows_in, rows_loaded, rows_rejected, error, retry_count, max_retries")
+
+
+def create_upload(
+    conn: Connection, upload_id: str, filename: str, content_type: str, storage_key: str,
+    *, tenant_id: str,
+) -> dict[str, Any]:
+    row = conn.execute(text(f"""
+        INSERT INTO uploads (upload_id, tenant_id, filename, content_type, storage_key)
+        VALUES (:upload_id, :tenant_id, :filename, :content_type, :storage_key)
+        RETURNING {_UPLOAD_COLS}
+    """), {"upload_id": upload_id, "tenant_id": tenant_id, "filename": filename,
+           "content_type": content_type, "storage_key": storage_key}).mappings().one()
+    return dict(row)
+
+
+def get_upload(conn: Connection, upload_id: str, *, tenant_id: str) -> dict[str, Any] | None:
+    row = conn.execute(text(f"""
+        SELECT {_UPLOAD_COLS} FROM uploads
+        WHERE tenant_id = :tenant_id AND upload_id = :upload_id
+    """), {"tenant_id": tenant_id, "upload_id": upload_id}).mappings().first()
+    return dict(row) if row else None
+
+
+def list_uploads(
+    conn: Connection, limit: int = 50, offset: int = 0, *, tenant_id: str,
+) -> list[dict[str, Any]]:
+    rows = conn.execute(text(f"""
+        SELECT {_UPLOAD_COLS} FROM uploads
+        WHERE tenant_id = :tenant_id
+        ORDER BY created_at DESC, upload_id LIMIT :limit OFFSET :offset
+    """), {"tenant_id": tenant_id, "limit": limit, "offset": offset}).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def set_upload_content(
+    conn: Connection, upload_id: str, size_bytes: int, sha256: str, *, tenant_id: str,
+) -> dict[str, Any] | None:
+    """Record the stored object's size/hash; a new file invalidates any earlier mapping."""
+    row = conn.execute(text(f"""
+        UPDATE uploads SET status = 'uploaded', size_bytes = :size_bytes, sha256 = :sha256,
+               mapping = NULL, updated_at = {_UTC_NOW}
+        WHERE tenant_id = :tenant_id AND upload_id = :upload_id
+        RETURNING {_UPLOAD_COLS}
+    """), {"tenant_id": tenant_id, "upload_id": upload_id,
+           "size_bytes": size_bytes, "sha256": sha256}).mappings().first()
+    return dict(row) if row else None
+
+
+def set_upload_mapping(
+    conn: Connection, upload_id: str, mapping: dict[str, Any], *, tenant_id: str,
+) -> dict[str, Any] | None:
+    row = conn.execute(text(f"""
+        UPDATE uploads SET status = 'mapped', mapping = CAST(:mapping AS JSONB),
+               updated_at = {_UTC_NOW}
+        WHERE tenant_id = :tenant_id AND upload_id = :upload_id
+        RETURNING {_UPLOAD_COLS}
+    """), {"tenant_id": tenant_id, "upload_id": upload_id,
+           "mapping": json.dumps(mapping)}).mappings().first()
+    return dict(row) if row else None
+
+
+def create_job(
+    conn: Connection, job_id: str, upload_id: str, max_retries: int, *, tenant_id: str,
+) -> dict[str, Any]:
+    row = conn.execute(text(f"""
+        INSERT INTO jobs (job_id, tenant_id, upload_id, max_retries)
+        VALUES (:job_id, :tenant_id, :upload_id, :max_retries)
+        RETURNING {_JOB_COLS}
+    """), {"job_id": job_id, "tenant_id": tenant_id, "upload_id": upload_id,
+           "max_retries": max_retries}).mappings().one()
+    return dict(row)
+
+
+def get_job(conn: Connection, job_id: str, *, tenant_id: str) -> dict[str, Any] | None:
+    row = conn.execute(text(f"""
+        SELECT {_JOB_COLS} FROM jobs
+        WHERE tenant_id = :tenant_id AND job_id = :job_id
+    """), {"tenant_id": tenant_id, "job_id": job_id}).mappings().first()
+    return dict(row) if row else None
+
+
+def list_jobs(
+    conn: Connection, status: str | None = None, limit: int = 50, offset: int = 0,
+    *, tenant_id: str,
+) -> list[dict[str, Any]]:
+    query = f"SELECT {_JOB_COLS} FROM jobs WHERE tenant_id = :tenant_id"
+    params: dict[str, Any] = {"tenant_id": tenant_id, "limit": limit, "offset": offset}
+    if status is not None:
+        query += " AND status = :status"
+        params["status"] = status
+    query += " ORDER BY created_at DESC, job_id LIMIT :limit OFFSET :offset"
+    return [dict(r) for r in conn.execute(text(query), params).mappings().all()]
+
+
+def get_active_job_for_upload(
+    conn: Connection, upload_id: str, *, tenant_id: str,
+) -> dict[str, Any] | None:
+    row = conn.execute(text(f"""
+        SELECT {_JOB_COLS} FROM jobs
+        WHERE tenant_id = :tenant_id AND upload_id = :upload_id
+          AND status IN ('queued', 'running')
+        ORDER BY created_at DESC LIMIT 1
+    """), {"tenant_id": tenant_id, "upload_id": upload_id}).mappings().first()
+    return dict(row) if row else None
+
+
+def set_job_stage(conn: Connection, job_id: str, stage: str, *, tenant_id: str) -> None:
+    """Record the current pipeline stage and refresh the heartbeat (locked_at)."""
+    conn.execute(text(f"""
+        UPDATE jobs SET stage = :stage, locked_at = {_UTC_NOW}
+        WHERE tenant_id = :tenant_id AND job_id = :job_id AND status = 'running'
+    """), {"tenant_id": tenant_id, "job_id": job_id, "stage": stage})
+
+
+def set_job_counts(
+    conn: Connection, job_id: str, *, rows_in: int, rows_loaded: int, rows_rejected: int,
+    tenant_id: str,
+) -> None:
+    conn.execute(text("""
+        UPDATE jobs SET rows_in = :rows_in, rows_loaded = :rows_loaded,
+               rows_rejected = :rows_rejected
+        WHERE tenant_id = :tenant_id AND job_id = :job_id
+    """), {"tenant_id": tenant_id, "job_id": job_id, "rows_in": rows_in,
+           "rows_loaded": rows_loaded, "rows_rejected": rows_rejected})
+
+
+def finish_job(
+    conn: Connection, job_id: str, *, status: str, error: str | None, tenant_id: str,
+) -> None:
+    if status not in ("succeeded", "failed"):
+        raise ValueError(f"finish_job: status must be succeeded/failed, got {status!r}")
+    conn.execute(text(f"""
+        UPDATE jobs SET status = :status, error = :error, stage = NULL, locked_at = NULL,
+               finished_at = {_UTC_NOW}
+        WHERE tenant_id = :tenant_id AND job_id = :job_id
+    """), {"tenant_id": tenant_id, "job_id": job_id, "status": status, "error": error})
+
+
+def requeue_job(
+    conn: Connection, job_id: str, *, error: str, delay_seconds: float, tenant_id: str,
+) -> None:
+    """Put a running job back on the queue after a transient failure."""
+    conn.execute(text(f"""
+        UPDATE jobs SET status = 'queued', retry_count = retry_count + 1, error = :error,
+               stage = NULL, locked_at = NULL,
+               run_after = {_UTC_NOW} + make_interval(secs => :delay)
+        WHERE tenant_id = :tenant_id AND job_id = :job_id
+    """), {"tenant_id": tenant_id, "job_id": job_id, "error": error, "delay": delay_seconds})
+
+
+def retry_failed_job(
+    conn: Connection, job_id: str, extra_retries: int, *, tenant_id: str,
+) -> dict[str, Any] | None:
+    """Manually re-queue a FAILED job (any other status -> None). Grants
+    `extra_retries` further automatic retries on top of those already used."""
+    row = conn.execute(text(f"""
+        UPDATE jobs SET status = 'queued', retry_count = retry_count + 1,
+               max_retries = retry_count + 1 + :extra, stage = NULL, locked_at = NULL,
+               finished_at = NULL, run_after = {_UTC_NOW}
+        WHERE tenant_id = :tenant_id AND job_id = :job_id AND status = 'failed'
+        RETURNING {_JOB_COLS}
+    """), {"tenant_id": tenant_id, "job_id": job_id, "extra": extra_retries}).mappings().first()
+    return dict(row) if row else None
+
+
+def replace_rejected_rows(
+    conn: Connection, job_id: str, rows: list[dict[str, Any]], *, tenant_id: str,
+) -> int:
+    """Store this job's rejected rows, replacing any from an earlier attempt
+    (a retry must not list the same rejection twice)."""
+    conn.execute(text("DELETE FROM rejected_rows WHERE tenant_id = :tenant_id AND job_id = :job_id"),
+                 {"tenant_id": tenant_id, "job_id": job_id})
+    if not rows:
+        return 0
+    conn.execute(text("""
+        INSERT INTO rejected_rows (tenant_id, job_id, row_number, code, reason, raw)
+        VALUES (:tenant_id, :job_id, :row_number, :code, :reason, CAST(:raw AS JSONB))
+    """), [{
+        "tenant_id": tenant_id, "job_id": job_id, "row_number": r.get("row_number"),
+        "code": r["code"], "reason": r["reason"],
+        "raw": None if r.get("raw") is None else json.dumps(r["raw"]),
+    } for r in rows])
+    return len(rows)
+
+
+def list_rejected_rows(
+    conn: Connection, job_id: str, limit: int = 100, offset: int = 0, *, tenant_id: str,
+) -> list[dict[str, Any]]:
+    rows = conn.execute(text("""
+        SELECT row_number, code, reason, raw FROM rejected_rows
+        WHERE tenant_id = :tenant_id AND job_id = :job_id
+        ORDER BY id LIMIT :limit OFFSET :offset
+    """), {"tenant_id": tenant_id, "job_id": job_id, "limit": limit, "offset": offset}).mappings().all()
+    return [dict(r) for r in rows]
+
+
+# --- worker writes -------------------------------------------------------
+
+def bulk_insert_sensor_readings(
+    conn: Connection, machine_ids: list[str], sensor_names: list[str],
+    timestamps: list[datetime], values: list[float], *, tenant_id: str,
+) -> int:
+    """One-statement bulk insert (parallel arrays through unnest). Same
+    idempotency as insert_sensor_readings (first write wins) but the returned
+    count is the statement's own rowcount, with no per-chunk COUNT(*) scans."""
+    if not machine_ids:
+        return 0
+    result = conn.execute(text("""
+        INSERT INTO sensor_readings (tenant_id, machine_id, sensor_name, ts, value)
+        SELECT :tenant_id, m, s, t, v
+        FROM unnest(CAST(:m AS text[]), CAST(:s AS text[]), CAST(:t AS timestamp[]),
+                    CAST(:v AS double precision[])) AS u(m, s, t, v)
+        ON CONFLICT (tenant_id, machine_id, sensor_name, ts) DO NOTHING
+    """), {"tenant_id": tenant_id, "m": machine_ids, "s": sensor_names,
+           "t": timestamps, "v": values})
+    return result.rowcount
+
+
+def upsert_machines_keep_known(
+    conn: Connection, machines: list[dict[str, Any]], *, tenant_id: str,
+) -> int:
+    """Like upsert_machines, but an upload that doesn't carry a machine's
+    line/type (UNASSIGNED / NULL) never erases what an earlier one recorded."""
+    if not machines:
+        return 0
+    rows = [{
+        "tenant_id": tenant_id, "machine_id": m["machine_id"],
+        "production_line": (m.get("production_line") or "UNASSIGNED"),
+        "type": m.get("type") if isinstance(m.get("type"), str) and m.get("type") else None,
+    } for m in machines]
+    conn.execute(text("""
+        INSERT INTO machines (tenant_id, machine_id, production_line, type)
+        VALUES (:tenant_id, :machine_id, :production_line, :type)
+        ON CONFLICT (tenant_id, machine_id) DO UPDATE SET
+            production_line = CASE WHEN EXCLUDED.production_line = 'UNASSIGNED'
+                                   THEN machines.production_line ELSE EXCLUDED.production_line END,
+            type = COALESCE(EXCLUDED.type, machines.type)
+    """), rows)
+    return len(rows)
+
+
+def fetch_readings_for_detection(
+    conn: Connection, machine_ids: list[str], since: list[datetime], sensor_names: list[str],
+    lookback: int, *, tenant_id: str,
+) -> list[tuple[str, str, datetime, float]]:
+    """For each machine: every stored reading at or after its `since` plus the
+    readings at the `lookback` distinct timestamps before it (the rolling
+    baseline's context). `machine_ids` and `since` are parallel lists."""
+    rows = conn.execute(text("""
+        WITH w AS (
+            SELECT * FROM unnest(CAST(:m AS text[]), CAST(:s AS timestamp[])) AS w(machine_id, since)
+        ), ctx AS (
+            SELECT machine_id, MIN(ts) AS cutoff FROM (
+                SELECT d.machine_id, d.ts,
+                       DENSE_RANK() OVER (PARTITION BY d.machine_id ORDER BY d.ts DESC) AS rk
+                FROM (SELECT DISTINCT r0.machine_id, r0.ts
+                      FROM sensor_readings r0 JOIN w ON w.machine_id = r0.machine_id
+                      WHERE r0.tenant_id = :tenant_id AND r0.ts < w.since
+                        AND r0.sensor_name = ANY(CAST(:names AS text[]))) d
+            ) q WHERE rk <= :lookback GROUP BY machine_id
+        )
+        SELECT r.machine_id, r.sensor_name, r.ts, r.value
+        FROM sensor_readings r
+        JOIN w ON w.machine_id = r.machine_id
+        LEFT JOIN ctx ON ctx.machine_id = r.machine_id
+        WHERE r.tenant_id = :tenant_id AND r.sensor_name = ANY(CAST(:names AS text[]))
+          AND r.ts >= COALESCE(ctx.cutoff, w.since)
+        ORDER BY r.machine_id, r.ts, r.sensor_name
+    """), {"tenant_id": tenant_id, "m": machine_ids, "s": since, "names": sensor_names,
+           "lookback": lookback}).all()
+    return [(r[0], r[1], r[2], float(r[3])) for r in rows]
+
+
+_SUMMARY_COLUMNS = (
+    "window_end", "avg_air_temp_k", "avg_process_temp_k", "avg_rotational_speed_rpm",
+    "avg_torque_nm", "tool_wear_min", "avg_production_rate", "avg_energy_consumption_kwh",
+    "avg_defect_rate", "reading_count", "anomalous_reading_count", "max_anomaly_score",
+    "health_status",
+)
+
+
+def upsert_sensor_summary(
+    conn: Connection, rows: list[dict[str, Any]], *, tenant_id: str,
+) -> int:
+    """Insert hourly rollups, UPDATING a window that already exists: an upload
+    that adds readings to an hour already summarised must refresh that hour."""
+    if not rows:
+        return 0
+    params = [{"tenant_id": tenant_id, "machine_id": r["machine_id"],
+               "window_start": r["window_start"],
+               **{c: r.get(c) for c in _SUMMARY_COLUMNS}} for r in rows]
+    cols = ", ".join(_SUMMARY_COLUMNS)
+    conn.execute(text(f"""
+        INSERT INTO sensor_summary (tenant_id, machine_id, window_start, {cols})
+        VALUES (:tenant_id, :machine_id, :window_start, {", ".join(":" + c for c in _SUMMARY_COLUMNS)})
+        ON CONFLICT (tenant_id, machine_id, window_start) DO UPDATE SET
+            {", ".join(f"{c} = EXCLUDED.{c}" for c in _SUMMARY_COLUMNS)}
+    """), params)
+    return len(params)
+
+
+def upsert_machine_anomalies(
+    conn: Connection, rows: list[dict[str, Any]], *, tenant_id: str,
+) -> int:
+    """Insert anomalies keyed by (tenant, machine, detected_at); a re-detected
+    one is refreshed in place, so re-running an upload adds nothing."""
+    if not rows:
+        return 0
+    params = [{"tenant_id": tenant_id, "machine_id": r["machine_id"],
+               "detected_at": r["detected_at"], "anomaly_score": int(r["anomaly_score"]),
+               "severity": r["severity"], "triggered_reasons": r.get("triggered_reasons")}
+              for r in rows]
+    conn.execute(text("""
+        INSERT INTO machine_anomalies
+            (tenant_id, machine_id, detected_at, anomaly_score, severity, triggered_reasons)
+        VALUES (:tenant_id, :machine_id, :detected_at, :anomaly_score, :severity, :triggered_reasons)
+        ON CONFLICT (tenant_id, machine_id, detected_at) DO UPDATE SET
+            anomaly_score = EXCLUDED.anomaly_score, severity = EXCLUDED.severity,
+            triggered_reasons = EXCLUDED.triggered_reasons
+    """), params)
+    return len(params)

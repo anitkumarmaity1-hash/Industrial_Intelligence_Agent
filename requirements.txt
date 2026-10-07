@@ -37,3 +37,7 @@ requests==2.32.3
 # every environment that touches sql/schema.sql (dev, CI, a real deploy)
 # needs this.
 alembic==1.20.0
+
+# Phase 3 (uploads + background worker): S3/MinIO object-storage provider (imported lazily;
+# the default local-filesystem backend and the tests do not need it at runtime).
+boto3==1.43.108

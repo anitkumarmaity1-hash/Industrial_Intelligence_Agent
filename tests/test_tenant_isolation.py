@@ -187,7 +187,7 @@ def test_composite_foreign_key_blocks_cross_tenant_child_rows(engine):
 # Static guard: a new query can't forget the tenant filter
 # ---------------------------------------------------------------------
 
-TENANT_TABLES = ("machines", "sensor_summary", "machine_anomalies", "maintenance_records",
+TENANT_TABLES = ("uploads", "jobs", "rejected_rows", "machines", "sensor_summary", "machine_anomalies", "maintenance_records",
                  "sensor_registry", "sensor_readings", "tenant_settings", "tenant_schema_mappings",
                  "investigation_audit_log", "ingestion_checkpoints")
 # Deliberately not tenant-scoped: public reference data / the credential lookup itself.
